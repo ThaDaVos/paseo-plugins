@@ -7,7 +7,8 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { deserializeMessage, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import type { FetchLike, Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
-import { terminateSpawnedProcessTree } from "./omp-rpc-process";
+import { terminateSpawnedProcessTree, PROCESS_STOP_TIMEOUT_MS } from "./omp-rpc-process";
+import type { ProcessTreeCleanup } from "./omp-rpc-process";
 import { OmpCleanupFailure } from "./security";
 
 const MAX_MCP_TRANSPORT_FRAME_BYTES = 1024 * 1024;
@@ -224,21 +225,54 @@ export class SupervisedStdioClientTransport implements Transport {
       this.notifyClose();
       return;
     }
-    const treeCleanup = this.startTreeCleanup();
-    if (!this.exited) {
+
+    if (this.exited) return;
+
+    class TimeOutError extends Error {}
+
+    const endStdinPromise = new Promise<ProcessTreeCleanup>((resolve, reject) => {
+      if (this.exited) {
+        resolve("verified");
+        return;
+      }
+
+      let timeout: number;
+      this.child.once("close", () => {
+        clearTimeout(timeout);
+        resolve("verified");
+      });
+      this.child.once("error", (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+
+      timeout = setTimeout(() => reject(new TimeOutError("MCP process did not close in time")), PROCESS_STOP_TIMEOUT_MS);
+
       try {
-        child.stdin.end();
-      } catch {
-        // Process-tree cleanup remains authoritative when stdin is already closed.
+        this.child.stdin.end();
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    try {
+      await endStdinPromise;
+    } catch (error) {
+      if (error instanceof TimeOutError) {
+        console.warn(`MCP stdio process did not close in time (${PROCESS_STOP_TIMEOUT_MS}ms), starting tree cleanup`);
+        let terminated = await this.startTreeCleanup();
+
+        if (!terminated) throw new Error("MCP stdio process tree cleanup failed");
       }
     }
-    const terminated = await treeCleanup;
-    const exited =
-      this.spawnFailedWithoutProcess ||
-      this.exited ||
-      (await waitForExit(this.exit.promise, PROCESS_EXIT_TIMEOUT_MS));
-    this.notifyClose();
-    if (!terminated || !exited) throw new Error("MCP stdio process tree cleanup failed");
+
+    if (
+      !this.spawnFailedWithoutProcess &&
+      !this.exited &&
+      !(await this.waitForExit(PROCESS_STOP_TIMEOUT_MS))
+    ) {
+      throw new Error("MCP stdio process did not close after tree cleanup");
+    }
   }
 }
 

@@ -473,16 +473,48 @@ export class OmpRpcProcess {
     this.flushProtocolViolations();
     this.clearChunk();
     this.failPending(new Error("OMP RPC process was closed"));
-    const cleanupPromise = this.startTreeCleanup();
-    if (!this.exited) {
+
+    if (this.exited) return;
+
+    class TimeOutError extends Error {}
+
+    const endStdinPromise = new Promise<ProcessTreeCleanup>((resolve, reject) => {
+      if (this.exited) {
+        resolve("verified");
+        return;
+      }
+
+      let timeout: number;
+      this.child.once("close", () => {
+        clearTimeout(timeout);
+        resolve("verified");
+      });
+      this.child.once("error", (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      });
+
+      timeout = setTimeout(() => reject(new TimeOutError("OMP RPC process did not close in time")), PROCESS_STOP_TIMEOUT_MS);
+
       try {
         this.child.stdin.end();
-      } catch {
-        // Continue waiting for process-tree cleanup when the input channel is already closed.
+      } catch (error) {
+        reject(error);
+      }
+    });
+
+    try {
+      await endStdinPromise;
+    } catch (error) {
+      if (error instanceof TimeOutError) {
+        console.warn(`OMP RPC process did not close in time (${PROCESS_STOP_TIMEOUT_MS}ms), starting tree cleanup`);
+        let cleanup = await this.startTreeCleanup();
+
+        if (cleanup === "uncertain" && this.exited) cleanup = "verified";
+        if (cleanup !== "verified") throw new Error("OMP RPC process tree cleanup failed");
       }
     }
-    const cleanup = await cleanupPromise;
-    if (cleanup !== "verified") throw new Error("OMP RPC process tree cleanup failed");
+
     if (
       !this.spawnFailedWithoutProcess &&
       !this.exited &&

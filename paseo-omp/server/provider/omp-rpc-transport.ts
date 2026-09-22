@@ -484,7 +484,7 @@ export class OmpRpcProcess {
         return;
       }
 
-      let timeout: number;
+      let timeout: TimerHandle;
       this.child.once("close", () => {
         clearTimeout(timeout);
         resolve("verified");
